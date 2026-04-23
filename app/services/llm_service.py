@@ -2,10 +2,13 @@
 HuggingFace LLM Service
 ========================
 Single source-of-truth for all AI calls.
-Uses HuggingFace Inference API (serverless) — no GPU needed on Railway.
+Uses HuggingFace Inference Providers (router.huggingface.co) — no GPU needed on Railway.
 
-Model: mistralai/Mistral-7B-Instruct-v0.3  (free tier, very capable)
-Fallback: HuggingFaceH4/zephyr-7b-beta
+Model: mistralai/Mistral-7B-Instruct-v0.3
+Provider: novita (free tier via HF token)
+
+REQUIRED: pip install openai
+ENV VAR:  HUGGINGFACEHUB_API_TOKEN
 """
 
 from __future__ import annotations
@@ -13,62 +16,40 @@ from __future__ import annotations
 import os
 import json
 import re
-import httpx
 from typing import Optional
 
+from openai import AsyncOpenAI
 from app.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-HF_TOKEN      = os.getenv("HUGGINGFACEHUB_API_TOKEN", "")
-HF_MODEL      = os.getenv(
-    "HF_LLM_MODEL",
-    "mistralai/Mistral-7B-Instruct-v0.3"
-)
-HF_API_BASE   = "https://api-inference.huggingface.co/models"
-TIMEOUT_SECS  = 120   # HF cold-start can be slow
+HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN", "")
+HF_MODEL = os.getenv("HF_LLM_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+HF_PROVIDER = os.getenv("HF_PROVIDER", "novita")  # novita | together | fireworks-ai
 
 
 class HFLLMService:
-    """Thin async wrapper around HuggingFace Inference API."""
+    """Async wrapper around HuggingFace Inference Providers (OpenAI-compatible)."""
 
     def __init__(self):
         if not HF_TOKEN:
             logger.warning("HUGGINGFACEHUB_API_TOKEN not set — AI calls will fail!")
-        self._client = httpx.AsyncClient(timeout=TIMEOUT_SECS)
-        self._headers = {
-            "Authorization": f"Bearer {HF_TOKEN}",
-            "Content-Type": "application/json",
-        }
+        self._client = AsyncOpenAI(
+            base_url=f"https://router.huggingface.co/{HF_PROVIDER}/v1",
+            api_key=HF_TOKEN,
+        )
 
     async def _call(self, prompt: str, max_new_tokens: int = 1500) -> str:
-        """Raw call to HF Inference API. Returns generated text."""
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": max_new_tokens,
-                "temperature": 0.4,
-                "top_p": 0.9,
-                "do_sample": True,
-                "return_full_text": False,
-            },
-            "options": {
-                "wait_for_model": True,   # wait instead of 503 on cold start
-                "use_cache": False,
-            },
-        }
-        url = f"{HF_API_BASE}/{HF_MODEL}"
+        """Call HF Inference Provider via OpenAI-compatible chat completions."""
         try:
-            resp = await self._client.post(url, json=payload, headers=self._headers)
-            resp.raise_for_status()
-            result = resp.json()
-            # HF returns list[{generated_text: ...}]
-            if isinstance(result, list) and result:
-                return result[0].get("generated_text", "").strip()
-            raise ValueError(f"Unexpected HF response format: {result}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HF API HTTP error: {e.response.status_code} — {e.response.text}")
-            raise RuntimeError(f"LLM service error: {e.response.status_code}")
+            resp = await self._client.chat.completions.create(
+                model=HF_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_new_tokens,
+                temperature=0.4,
+                top_p=0.9,
+            )
+            return resp.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"HF API call failed: {e}")
             raise RuntimeError(f"LLM service unavailable: {str(e)}")
@@ -83,11 +64,8 @@ class HFLLMService:
         daily_hours: float,
         start_date: str,
     ) -> dict:
-        """
-        Given raw syllabus text, return structured JSON with topics + schedule.
-        """
-        prompt = f"""<s>[INST]
-You are an expert academic planner AI. A student has provided their syllabus text.
+        """Given raw syllabus text, return structured JSON with topics + schedule."""
+        prompt = f"""You are an expert academic planner AI. A student has provided their syllabus text.
 Your job is to:
 1. Extract all topics and subtopics from the syllabus.
 2. Estimate hours needed per topic based on complexity.
@@ -128,10 +106,9 @@ Return ONLY a valid JSON object (no markdown, no explanation) with this exact st
       "notes": "<optional note>"
     }}
   ]
-}}
-[/INST]"""
+}}"""
 
-        raw = await self._call(prompt, max_new_tokens=3000)
+        raw = await self._call(prompt, max_new_tokens=1500)
         return self._parse_json_response(raw)
 
     async def generate_lecture(
@@ -146,8 +123,7 @@ Return ONLY a valid JSON object (no markdown, no explanation) with this exact st
         name_str = f"Student name: {student_name}." if student_name else ""
         subtopics_str = ", ".join(subtopics) if subtopics else "general concepts"
 
-        prompt = f"""<s>[INST]
-You are EduAI, an expert teacher conducting a live lecture. {name_str}
+        prompt = f"""You are EduAI, an expert teacher conducting a live lecture. {name_str}
 Deliver a complete, engaging lecture on the following topic.
 
 Topic: {topic_title}
@@ -164,10 +140,9 @@ Return ONLY a valid JSON object (no markdown fences) with this structure:
   "practice_questions": ["<q1>", "<q2>", "<q3>"],
   "estimated_read_minutes": <int>,
   "next_topic_preview": "<1-2 sentence teaser about the next topic>"
-}}
-[/INST]"""
+}}"""
 
-        raw = await self._call(prompt, max_new_tokens=2500)
+        raw = await self._call(prompt, max_new_tokens=1500)
         return self._parse_json_response(raw)
 
     async def solve_doubt(
@@ -181,8 +156,7 @@ Return ONLY a valid JSON object (no markdown fences) with this structure:
         name_str = f"The student's name is {student_name}." if student_name else ""
         ctx_str  = f"\nAdditional context: {context}" if context else ""
 
-        prompt = f"""<s>[INST]
-You are EduAI, a patient and brilliant tutor. {name_str}
+        prompt = f"""You are EduAI, a patient and brilliant tutor. {name_str}
 A student has a doubt about a topic. Answer it thoroughly, clearly, and with examples.
 
 Topic: {topic}
@@ -195,10 +169,9 @@ Return ONLY a valid JSON object (no markdown fences) with this structure:
   "answer": "<Detailed answer in Markdown. Use examples, analogies. Minimum 300 words.>",
   "related_concepts": ["<concept1>", "<concept2>", "<concept3>"],
   "follow_up_questions": ["<follow-up q1>", "<follow-up q2>"]
-}}
-[/INST]"""
+}}"""
 
-        raw = await self._call(prompt, max_new_tokens=1500)
+        raw = await self._call(prompt, max_new_tokens=1000)
         return self._parse_json_response(raw)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -206,20 +179,17 @@ Return ONLY a valid JSON object (no markdown fences) with this structure:
     @staticmethod
     def _parse_json_response(raw: str) -> dict:
         """Robustly extract JSON from LLM output."""
-        # Try direct parse first
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
             pass
 
-        # Strip markdown code fences
         cleaned = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
 
-        # Find first { ... } block
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if match:
             try:
