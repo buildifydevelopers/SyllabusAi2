@@ -24,8 +24,8 @@ from app.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN", "")
-HF_MODEL = os.getenv("HF_LLM_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
-HF_PROVIDER = os.getenv("HF_PROVIDER", "novita")  # novita | together | fireworks-ai
+HF_MODEL = os.getenv("HF_LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+HF_PROVIDER = os.getenv("HF_PROVIDER", "featherless-ai")  # novita | together | fireworks-ai
 
 
 class HFLLMService:
